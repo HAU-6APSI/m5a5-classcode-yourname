@@ -1,0 +1,165 @@
+name: Autograde
+
+# On every push: run the contract tests, build the app, then start the real API
+# and load the built front end in a real browser at phone / tablet / desktop
+# widths to (a) check there is no horizontal scrolling on mobile and (b) publish
+# a screenshot at each width. The screenshots go to a separate "previews" branch
+# and are linked from the run summary, so your working branch is never touched.
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Run contract tests
+        run: npx vitest run --reporter=default --reporter=json --outputFile=test-results.json
+
+      - name: Build the app
+        if: always()
+        id: build
+        continue-on-error: true
+        run: npm run build
+
+      - name: Install browser for preview
+        if: ${{ always() && steps.build.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          npm i -D playwright >/dev/null 2>&1
+          npx playwright install --with-deps chromium
+
+      - name: Screenshot at three widths + check mobile overflow
+        if: ${{ always() && steps.build.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          TS=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+          echo "TS=$TS" >> "$GITHUB_ENV"
+
+          # The front end is nothing without its API, so start the real one
+          # (in-memory Postgres, seeded with demo data) before taking pictures.
+          npm run api &
+          API_PID=$!
+          for i in $(seq 1 30); do curl -sf http://localhost:3000/health >/dev/null && break; sleep 1; done
+
+          npx vite preview --port 4173 &
+          SERVER_PID=$!
+          for i in $(seq 1 30); do curl -sf http://localhost:4173/ >/dev/null && break; sleep 1; done
+
+          mkdir -p "submission/$TS"
+          cat > shot.mjs <<'EOF'
+          import { chromium } from 'playwright'
+          import { writeFileSync } from 'node:fs'
+          const ts = process.argv[2]
+          const widths = [
+            { name: 'mobile-375', w: 375, h: 800 },
+            { name: 'tablet-768', w: 768, h: 1024 },
+            { name: 'desktop-1280', w: 1280, h: 900 },
+          ]
+          const browser = await chromium.launch()
+          let mobileOverflow = null
+          let dataRendered = false
+          const shots = []
+          for (const v of widths) {
+            const page = await browser.newPage({ viewport: { width: v.w, height: v.h } })
+            await page.goto('http://localhost:4173/', { waitUntil: 'networkidle', timeout: 15000 }).catch(() => {})
+            // networkidle alone is not enough for an app that fetches its data:
+            // it can settle before the first paint, which is how a screenshot
+            // ends up blank white. Wait for real content, then a beat for fonts.
+            const seen = await page
+              .waitForSelector('[data-testid="sighting-card"], [data-testid="empty"], [data-testid="error"]', { timeout: 15000 })
+              .then(() => true)
+              .catch(() => false)
+            dataRendered = dataRendered || seen
+            await page.waitForTimeout(600)
+            await page.screenshot({ path: `submission/${ts}/${v.name}.png`, fullPage: true })
+            if (v.w === 375) {
+              mobileOverflow = await page.evaluate(() => {
+                const el = document.documentElement
+                return el.scrollWidth - el.clientWidth > 2 // small tolerance
+              })
+            }
+            shots.push(v.name)
+            await page.close()
+          }
+          await browser.close()
+          const responsive = mobileOverflow === false
+          const md = [
+            `# App preview - ${ts}`, '',
+            `**Responsive (no horizontal scroll at 375px):** ${responsive ? '✅ pass' : '❌ fail'}`,
+            `**Rendered data from the API:** ${dataRendered ? '✅ yes' : '⚠️ nothing appeared'}`, '',
+            ...shots.flatMap((n) => [`## ${n}`, '', `![${n}](./${n}.png)`, '']),
+          ].join('\n')
+          writeFileSync(`submission/${ts}/README.md`, md)
+          writeFileSync(`submission/${ts}/responsive.txt`, responsive ? 'pass' : 'fail')
+          console.log(`RESPONSIVE=${responsive ? 'pass' : 'fail'} DATA=${dataRendered ? 'yes' : 'no'}`)
+          EOF
+          node shot.mjs "$TS" || true
+          kill $SERVER_PID 2>/dev/null || true
+          kill $API_PID 2>/dev/null || true
+
+      - name: Publish preview to previews branch
+        if: ${{ always() && env.TS != '' }}
+        continue-on-error: true
+        run: |
+          [ -d "submission/$TS" ] || exit 0
+          git config user.name "course-bot"
+          git config user.email "course-bot@users.noreply.github.com"
+          WT="$RUNNER_TEMP/previews"
+          git fetch origin previews 2>/dev/null || true
+          if git show-ref --verify --quiet refs/remotes/origin/previews; then
+            git worktree add "$WT" -B previews origin/previews
+          else
+            git worktree add --detach "$WT" HEAD
+            git -C "$WT" checkout --orphan previews
+            git -C "$WT" rm -rf . >/dev/null 2>&1 || true
+          fi
+          mkdir -p "$WT/submission"
+          cp -r "submission/$TS" "$WT/submission/$TS"
+          git -C "$WT" add submission
+          git -C "$WT" diff --cached --quiet && { echo "no preview change"; exit 0; }
+          git -C "$WT" commit -m "📸 App preview $TS [skip ci]"
+          git -C "$WT" push origin previews
+
+      - name: Write grading summary
+        if: always()
+        run: |
+          node <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          const fs = require('fs');
+          let r;
+          try { r = JSON.parse(fs.readFileSync('test-results.json', 'utf8')); }
+          catch { console.log('## ❌ Tests did not run (build/install error)'); process.exit(0); }
+          const tests = r.testResults.flatMap(f => f.assertionResults);
+          const passed = tests.filter(t => t.status === 'passed').length;
+          const total = tests.length;
+          console.log(`## ${passed === total ? '✅' : '❌'} ${passed} / ${total} contract tests passed`);
+          console.log('');
+          console.log('| Result | Test |');
+          console.log('| --- | --- |');
+          for (const t of tests) {
+            console.log(`| ${t.status === 'passed' ? '✅' : '❌'} | ${t.fullName || t.title} |`);
+          }
+          const ts = process.env.TS;
+          if (ts) {
+            let resp = '';
+            try { resp = fs.readFileSync(`submission/${ts}/responsive.txt`, 'utf8').trim(); } catch {}
+            const url = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/blob/previews/submission/${ts}/README.md`;
+            console.log('');
+            if (resp) console.log(`**Responsive (no h-scroll @375px):** ${resp === 'pass' ? '✅ pass' : '❌ fail'}`);
+            console.log('');
+            console.log(`📸 **App preview (phone / tablet / desktop):** [view screenshots](${url})`);
+          }
+          EOF

@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+.env.*
+.claude/
+test-results.json
+.vit.json
+submission/

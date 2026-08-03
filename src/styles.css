@@ -1,0 +1,21 @@
+/* Your styling goes here. This file is deliberately almost empty.
+ *
+ * The design half of this activity is graded from a screenshot of your running
+ * app, so this is where those marks are won: layout, type, colour, spacing, and
+ * a page that does not break on a phone.
+ *
+ * A starting point, nothing more. Delete it and make it yours.
+ */
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: system-ui, sans-serif;
+}
+
+.app {
+  max-width: 60rem;
+  margin: 0 auto;
+  padding: 1.5rem;
+}
