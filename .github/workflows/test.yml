@@ -7,10 +7,15 @@ name: Autograde
 # and are linked from the run summary, so your working branch is never touched.
 on:
   push:
+    branches-ignore: [previews]
   workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -35,12 +40,19 @@ jobs:
         continue-on-error: true
         run: npm run build
 
+      - name: Cache the preview browser
+        if: ${{ always() && env.HAS_CONTENT == '1' }}
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ms-playwright-chromium-${{ runner.os }}
+
       - name: Install browser for preview
         if: ${{ always() && steps.build.outcome == 'success' }}
         continue-on-error: true
         run: |
           npm i -D playwright >/dev/null 2>&1
-          npx playwright install --with-deps chromium
+          npx playwright install chromium
 
       - name: Screenshot at three widths + check mobile overflow
         if: ${{ always() && steps.build.outcome == 'success' }}
